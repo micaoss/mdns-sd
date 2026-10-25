@@ -128,6 +128,11 @@ const SHARED_RESPONSE_DELAY_MIN_MILLIS: u64 = 10;
 /// 120ms suggested in the RFC is too long for max, use 50ms instead.
 const SHARED_RESPONSE_DELAY_MAX_MILLIS: u64 = 50;
 
+/// The most legacy unicast responses (RFC 6762 §6.7) sent in one second, over
+/// every interface. Each answers a query to its source address and port, so
+/// a cap bounds what a flood of queries can make this host send.
+const LEGACY_UNICAST_MAX_PER_SECOND: u32 = 50;
+
 /// RFC 6762 §5.2: to avoid accidental synchronization when multiple clients
 /// begin querying at exactly the same moment (e.g. because of some common
 /// external trigger event), a querier SHOULD delay the first query of a
@@ -1214,6 +1219,11 @@ struct Zeroconf {
 
     status: DaemonStatus,
 
+    /// Start of the current one-second window of legacy unicast responses,
+    /// and how many were sent in it.
+    legacy_unicast_window: Instant,
+    legacy_unicast_sent: u32,
+
     /// Service instances that are pending for resolving SRV and TXT.
     pending_resolves: HashSet<String>,
 
@@ -1453,6 +1463,8 @@ impl Zeroconf {
             include_apple_p2p: false,
             cmd_sender,
             signal_addr,
+            legacy_unicast_window: Instant::now(),
+            legacy_unicast_sent: 0,
 
             #[cfg(test)]
             test_down_interfaces: HashSet::new(),
@@ -3796,6 +3808,16 @@ impl Zeroconf {
         };
 
         if unicast_dest.is_some() {
+            let now = Instant::now();
+            if now.duration_since(self.legacy_unicast_window) >= Duration::from_secs(1) {
+                self.legacy_unicast_window = now;
+                self.legacy_unicast_sent = 0;
+            }
+            if self.legacy_unicast_sent >= LEGACY_UNICAST_MAX_PER_SECOND {
+                debug!("send_response: legacy unicast limit reached, dropping response to {querier_addr}");
+                return;
+            }
+            self.legacy_unicast_sent += 1;
             for q in msg.questions() {
                 out.add_question(q.entry_name(), q.entry_type());
             }
@@ -5556,8 +5578,9 @@ mod tests {
         valid_instance_name, valid_ip_on_intf, DaemonEvent, HostnameResolutionEvent, IfKind,
         MaxPacketSizeSelection, MyIntf, SendConfig, ServiceDaemon, ServiceEvent, ServiceInfo,
         GROUP_ADDR_V4, INITIAL_QUERY_DELAY_MAX_MILLIS, INITIAL_QUERY_DELAY_MIN_MILLIS,
-        MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT, MDNS_PORT, MIN_MAX_PACKET_SIZE, RESOLVE_MAX_TRY,
-        SHARED_RESPONSE_DELAY_MAX_MILLIS, SHARED_RESPONSE_DELAY_MIN_MILLIS,
+        LEGACY_UNICAST_MAX_PER_SECOND, MAX_PKT_ABSOLUTE_IPV6, MAX_PKT_DEFAULT, MDNS_PORT,
+        MIN_MAX_PACKET_SIZE, RESOLVE_MAX_TRY, SHARED_RESPONSE_DELAY_MAX_MILLIS,
+        SHARED_RESPONSE_DELAY_MIN_MILLIS,
     };
     use crate::{
         dns_parser::{
@@ -7581,6 +7604,38 @@ mod tests {
             !ask(&mut daemon, Ipv4Addr::new(127, 0, 0, 2)),
             "an off-link querier must not be answered"
         );
+    }
+
+    #[test]
+    fn test_legacy_unicast_responses_are_capped_per_second() {
+        let (mut daemon, index) = negative_answer_test_daemon();
+        register_negative_answer_test_service(
+            &mut daemon,
+            index,
+            "capped",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let querier = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        querier
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let interface = InterfaceId {
+            name: "loopback-test".to_string(),
+            index,
+        };
+        for _ in 0..LEGACY_UNICAST_MAX_PER_SECOND + 10 {
+            let mut out = DnsOutgoing::new(FLAGS_QR_QUERY);
+            out.add_question("negative.local.", RRType::A);
+            let packets = out.to_data_on_wire(MAX_PKT_DEFAULT, true);
+            let incoming = DnsIncoming::new(packets[0].clone(), interface.clone()).unwrap();
+            daemon.handle_query(incoming, index, querier.local_addr().unwrap());
+        }
+        let mut data = [0; 4096];
+        let mut answered = 0;
+        while querier.recv_from(&mut data).is_ok() {
+            answered += 1;
+        }
+        assert_eq!(answered, LEGACY_UNICAST_MAX_PER_SECOND);
     }
 
     #[test]
